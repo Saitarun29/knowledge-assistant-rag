@@ -1,0 +1,672 @@
+{
+  "name": "Knowledge Assistant — Drive/Notion ingest → pgvector",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 📚 Knowledge ingest → pgvector (production path)\n\n**What it does** — every 6 hours (or on demand) pulls docs that changed since the last run from **Google Drive** (a KB folder of Google Docs) and **Notion** (a KB database), normalises them, splits them into heading-aware chunks (~900 chars, 150 overlap), embeds each chunk with **OpenAI text-embedding-3-small** (1536-d) and **upserts** them into **Supabase / pgvector** (`kb_chunks`). Stale chunks of edited docs are pruned, then the watermark is saved.\n\n**Idempotent** — `chunk_id = docId#index` + `content_hash`; unchanged chunks are skipped, re-runs are safe.\n\n**Env vars (no secrets in this file)**\n`KB_DRIVE_FOLDER_ID` · `NOTION_TOKEN` · `NOTION_KB_DATABASE_ID` · `OPENAI_API_KEY` · `SUPABASE_URL` · `SUPABASE_SERVICE_ROLE_KEY`\nCredential: *Google Drive OAuth2* on the two Drive HTTP nodes.\nCode nodes need `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.\n\n**Schema** — run `supabase/schema.sql` first (tables, HNSW index, `match_kb_chunks` hybrid search, `prune_doc_chunks`).\n\nUsing only one source? Delete the other branch (Merge then passes a single input through).\n\nThe watermark lives in workflow static data, which only persists for **active** (production) executions; manual runs re-ingest everything (safe, just slower).",
+        "height": 620,
+        "width": 520,
+        "color": 5
+      },
+      "id": "28e1225e-bf86-4d40-ab58-6b91fe99ac0b",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -420,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "d87417d5-9f86-40e4-984f-cb25ed82d5ec",
+      "name": "Every 6 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        160,
+        120
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "0371119d-05c9-48d1-b0ee-646276a13411",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        160,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Incremental sync: only fetch docs edited since the last successful run.\nconst state = $getWorkflowStaticData('global');\nconst since = state.lastSuccessfulRun || '1970-01-01T00:00:00.000Z';\nreturn [{ json: { since, startedAt: new Date().toISOString() } }];"
+      },
+      "id": "081083d9-ed1f-4990-a0a2-ffcf3efe60e5",
+      "name": "Get watermark",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "='{{ $env.KB_DRIVE_FOLDER_ID }}' in parents and mimeType = 'application/vnd.google-apps.document' and trashed = false and modifiedTime > '{{ $json.since }}'"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,modifiedTime,webViewLink,lastModifyingUser/displayName)"
+            },
+            {
+              "name": "pageSize",
+              "value": "200"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "eccb43bc-9084-48c5-9565-fcc81837de7c",
+      "name": "Drive: list changed docs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        640,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "files",
+        "options": {}
+      },
+      "id": "bb0d99ad-a677-453a-87ed-83b167aab2be",
+      "name": "Split Drive files",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        860,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://www.googleapis.com/drive/v3/files/{{ $json.id }}/export",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "mimeType",
+              "value": "text/plain"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "text"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "c97b16c0-030e-4dff-85d4-c00c54eaaeab",
+      "name": "Drive: export as text",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1080,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Shape every source into one document contract.\nconst files = $('Split Drive files').all();\nreturn $input.all().map((item, i) => {\n  const f = files[i].json;\n  return { json: {\n    source: 'gdrive',\n    docId: `gdrive:${f.id}`,\n    title: f.name,\n    url: f.webViewLink,\n    owner: f.lastModifyingUser?.displayName || null,\n    updatedAt: f.modifiedTime,\n    text: String(item.json.text || '').replace(/\\r/g, ''),\n  } };\n});"
+      },
+      "id": "807d66c3-14a2-4a71-8e06-928918a0a210",
+      "name": "Normalise Drive",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.notion.com/v1/databases/{{ $env.NOTION_KB_DATABASE_ID }}/query",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.NOTION_TOKEN }}"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ page_size: 100, filter: { timestamp: 'last_edited_time', last_edited_time: { after: $json.since } } }) }}",
+        "options": {}
+      },
+      "id": "fdffd9a3-d7ac-45c0-87f3-92b4df534f05",
+      "name": "Notion: query changed pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        640,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "results",
+        "options": {}
+      },
+      "id": "4fd5ab08-56f5-4c6b-953e-ac8705339b30",
+      "name": "Split Notion pages",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        860,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.notion.com/v1/blocks/{{ $json.id }}/children",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "page_size",
+              "value": "100"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.NOTION_TOKEN }}"
+            },
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 3,
+              "batchInterval": 400
+            }
+          }
+        }
+      },
+      "id": "5a9673fb-0270-4420-ae0e-1dc9874dea16",
+      "name": "Notion: get page blocks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1080,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Flatten Notion blocks to markdown-ish text (headings become chunk boundaries).\nconst pages = $('Split Notion pages').all();\nconst rt = (arr = []) => arr.map((t) => t.plain_text).join('');\nconst toLine = (b) => {\n  const v = b[b.type] || {};\n  switch (b.type) {\n    case 'heading_1': return `# ${rt(v.rich_text)}`;\n    case 'heading_2': return `## ${rt(v.rich_text)}`;\n    case 'heading_3': return `### ${rt(v.rich_text)}`;\n    case 'bulleted_list_item': case 'to_do': return `- ${rt(v.rich_text)}`;\n    case 'numbered_list_item': return `1. ${rt(v.rich_text)}`;\n    case 'quote': case 'callout': case 'paragraph': return rt(v.rich_text);\n    case 'code': return rt(v.rich_text);\n    default: return '';\n  }\n};\nreturn $input.all().map((item, i) => {\n  const p = pages[i].json;\n  const titleProp = Object.values(p.properties || {}).find((x) => x.type === 'title');\n  return { json: {\n    source: 'notion',\n    docId: `notion:${p.id}`,\n    title: rt(titleProp?.title) || 'Untitled',\n    url: p.url,\n    owner: p.last_edited_by?.id || null,\n    updatedAt: p.last_edited_time,\n    text: (item.json.results || []).map(toLine).filter(Boolean).join('\\n\\n'),\n  } };\n});"
+      },
+      "id": "9467e582-b935-4d36-bd57-29543b5effe9",
+      "name": "Normalise Notion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        340
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "34a52819-1ba8-44d6-862d-137bb03195b5",
+      "name": "Merge sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1520,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Heading-aware chunking with overlap — same strategy as lib/rag.js in the app.\nconst crypto = require('crypto');\nconst MAX = 900, OVERLAP = 150;\nconst out = [];\nfor (const { json: doc } of $input.all()) {\n  if (!doc.text || doc.text.trim().length < 40) continue;\n  const sections = [];\n  let cur = { heading: doc.title, body: [] };\n  for (const line of doc.text.split('\\n')) {\n    const h = line.match(/^#{1,3}\\s+(.+)/);\n    if (h) { if (cur.body.join('').trim()) sections.push(cur); cur = { heading: h[1].trim(), body: [] }; }\n    else cur.body.push(line);\n  }\n  if (cur.body.join('').trim()) sections.push(cur);\n  let n = 0;\n  for (const s of sections) {\n    const text = s.body.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();\n    for (let start = 0; start < text.length; start += MAX - OVERLAP) {\n      let end = Math.min(start + MAX, text.length);\n      if (end < text.length) { const cut = text.lastIndexOf('\\n', end); if (cut > start + MAX / 2) end = cut; }\n      const content = text.slice(start, end).trim();\n      if (!content) continue;\n      const embedText = `${doc.title} › ${s.heading}\\n${content}`;\n      out.push({ json: {\n        chunk_id: `${doc.docId}#${++n}`,\n        doc_id: doc.docId, source: doc.source, title: doc.title, url: doc.url, section: s.heading,\n        content, embed_text: embedText,\n        content_hash: crypto.createHash('sha256').update(embedText).digest('hex'),\n        token_estimate: Math.ceil(embedText.length / 4), updated_at: doc.updatedAt,\n      } });\n      if (end >= text.length) break;\n    }\n  }\n}\nreturn out;"
+      },
+      "id": "68fedd6e-3902-4f31-821b-31b5ce211801",
+      "name": "Chunk documents",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENAI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'text-embedding-3-small', input: $json.embed_text }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 20,
+              "batchInterval": 1000
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "c0788025-089b-4a38-ad0c-1c3faf377683",
+      "name": "Embed (OpenAI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1960,
+        220
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const chunks = $('Chunk documents').all();\nreturn $input.all().map((item, i) => {\n  const { embed_text, ...row } = chunks[i].json;\n  return { json: { ...row, embedding: item.json.data[0].embedding, embedding_model: 'text-embedding-3-small' } };\n});"
+      },
+      "id": "83cbfed3-652e-4359-95f4-876b48bb47d7",
+      "name": "Attach vectors",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2180,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/kb_chunks",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "on_conflict",
+              "value": "chunk_id"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 50,
+              "batchInterval": 200
+            }
+          }
+        }
+      },
+      "id": "66343bf5-c8a0-4eb2-a104-3ef13f23f2e6",
+      "name": "Upsert to Supabase (pgvector)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        220
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Chunks that no longer exist in an edited doc must be removed from the index.\nconst byDoc = {};\nfor (const { json: c } of $('Attach vectors').all()) (byDoc[c.doc_id] ||= []).push(c.chunk_id);\nreturn Object.entries(byDoc).map(([doc_id, keep_ids]) => ({ json: { doc_id, keep_ids } }));"
+      },
+      "id": "227e3ed2-5b18-46ef-ac29-9d31205b0bba",
+      "name": "Group chunk ids per doc",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2620,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/rpc/prune_doc_chunks",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_doc_id: $json.doc_id, p_keep_ids: $json.keep_ids }) }}",
+        "options": {}
+      },
+      "id": "67bd0054-005a-4153-aed7-33ca534717c7",
+      "name": "Prune stale chunks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2840,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const state = $getWorkflowStaticData('global');\nstate.lastSuccessfulRun = $('Get watermark').first().json.startedAt;\nconst chunks = $('Attach vectors').all().length;\nconst docs = $('Group chunk ids per doc').all().length;\nreturn [{ json: { ok: true, docs, chunks, watermark: state.lastSuccessfulRun } }];"
+      },
+      "id": "35283f16-96ca-4dfc-9b4e-e70727f3af1d",
+      "name": "Save watermark + summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3060,
+        220
+      ]
+    }
+  ],
+  "connections": {
+    "Every 6 hours": {
+      "main": [
+        [
+          {
+            "node": "Get watermark",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Get watermark",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get watermark": {
+      "main": [
+        [
+          {
+            "node": "Drive: list changed docs",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notion: query changed pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: list changed docs": {
+      "main": [
+        [
+          {
+            "node": "Split Drive files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Drive files": {
+      "main": [
+        [
+          {
+            "node": "Drive: export as text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: export as text": {
+      "main": [
+        [
+          {
+            "node": "Normalise Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion: query changed pages": {
+      "main": [
+        [
+          {
+            "node": "Split Notion pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Notion pages": {
+      "main": [
+        [
+          {
+            "node": "Notion: get page blocks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion: get page blocks": {
+      "main": [
+        [
+          {
+            "node": "Normalise Notion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Drive": {
+      "main": [
+        [
+          {
+            "node": "Merge sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Notion": {
+      "main": [
+        [
+          {
+            "node": "Merge sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge sources": {
+      "main": [
+        [
+          {
+            "node": "Chunk documents",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk documents": {
+      "main": [
+        [
+          {
+            "node": "Embed (OpenAI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed (OpenAI)": {
+      "main": [
+        [
+          {
+            "node": "Attach vectors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach vectors": {
+      "main": [
+        [
+          {
+            "node": "Upsert to Supabase (pgvector)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert to Supabase (pgvector)": {
+      "main": [
+        [
+          {
+            "node": "Group chunk ids per doc",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group chunk ids per doc": {
+      "main": [
+        [
+          {
+            "node": "Prune stale chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prune stale chunks": {
+      "main": [
+        [
+          {
+            "node": "Save watermark + summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

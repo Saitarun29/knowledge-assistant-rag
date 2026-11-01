@@ -1,0 +1,12 @@
+{
+  "name": "knowledge-assistant-rag",
+  "version": "1.0.0",
+  "description": "Internal Knowledge Assistant — retrieval-augmented chat over company docs with citations, a retrieval debug view and an n8n ingest pipeline.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev-server.mjs",
+    "test": "node scripts/smoke.mjs"
+  },
+  "license": "MIT"
+}

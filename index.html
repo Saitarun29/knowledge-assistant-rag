@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Knowledge Assistant · Cited answers from internal docs</title>
+  <meta name="description" content="Retrieval-augmented question answering over internal documents. Every answer cites its source passages, shows how they were retrieved, and declines when the docs don't cover the question. Built by Sai Tarun." />
+  <meta property="og:title" content="Knowledge Assistant · Cited answers from internal docs" />
+  <meta property="og:description" content="Ask a question, get an answer with citations to the exact passages, a retrieval inspector, and a clear refusal when the docs don't say." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://knowledge-assistant-rag.vercel.app" />
+  <meta property="og:image" content="https://knowledge-assistant-rag.vercel.app/docs/screenshot.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="theme-color" content="#F7F7F5" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111111'/%3E%3Cpath d='M10 9h8.5a3.5 3.5 0 0 1 3.5 3.5V23h-8.5A3.5 3.5 0 0 1 10 19.5z' fill='none' stroke='white' stroke-width='2'/%3E%3Cpath d='M14 14h4M14 17.5h4' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <a class="skip" href="#q">Skip to question</a>
+
+  <header class="top">
+    <div class="top-inner">
+      <div class="brand">
+        <span class="mark" aria-hidden="true">
+          <svg viewBox="0 0 16 16"><path d="M4 3.5h5.25A2.25 2.25 0 0 1 11.5 5.75V12.5H6.25A2.25 2.25 0 0 1 4 10.25z" /><path d="M6.5 6.5h2.5M6.5 9h2.5" /></svg>
+        </span>
+        <span class="product">Knowledge Assistant</span>
+        <span class="sep" aria-hidden="true"></span>
+        <span class="tagline">Cited answers from your internal docs</span>
+      </div>
+      <div class="top-right">
+        <button type="button" class="btn sm only-mobile" id="openDocs" aria-controls="leftCol">Documents</button>
+        <span class="stack">BM25 · Gemini · n8n</span>
+        <span id="modeBadge" class="badge badge-wait" role="status" title="Checking API"><i aria-hidden="true"></i><b>Checking</b></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="app" id="app">
+    <!-- Sidebar: knowledge base + temporary document -->
+    <aside class="col-left" id="leftCol" aria-label="Knowledge base">
+      <section class="side-section">
+        <div class="section-head">
+          <h2>Knowledge base</h2>
+          <span class="count" id="kbStats">–</span>
+        </div>
+        <p class="section-sub">Northwind Labs · sample workspace</p>
+        <ul class="doc-list" id="docList" aria-label="Documents">
+          <li class="skeleton"></li><li class="skeleton"></li><li class="skeleton"></li><li class="skeleton"></li>
+        </ul>
+      </section>
+
+      <section class="side-section paste">
+        <div class="section-head">
+          <h2>Temporary document</h2>
+          <span class="pill soft" id="userDocState">Off</span>
+        </div>
+        <p class="section-sub">Paste text to include it in retrieval. Kept in this browser tab and sent with each question; never stored.</p>
+        <label class="field-label" for="userDocTitle">Title</label>
+        <input id="userDocTitle" class="input" maxlength="80" placeholder="Office guide" autocomplete="off" />
+        <label class="field-label" for="userDocText">Content</label>
+        <textarea id="userDocText" class="input" rows="5" maxlength="20000" placeholder="Paste up to 20,000 characters"></textarea>
+        <div class="paste-foot">
+          <span class="counter" id="userDocCount">0 / 20,000</span>
+          <div class="paste-actions">
+            <button type="button" class="btn sm" id="sampleDoc">Load sample</button>
+            <button type="button" class="btn sm ghost" id="clearDoc">Clear</button>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- Conversation -->
+    <section class="col-chat" aria-label="Conversation">
+      <div class="pane-head">
+        <div class="pane-title">
+          <h1>Ask Northwind</h1>
+          <span class="pane-sub">Answers use only the indexed documents</span>
+        </div>
+        <button type="button" class="btn sm" id="newChat" title="Clear the conversation">New chat</button>
+      </div>
+
+      <div class="messages" id="messages" aria-live="polite" aria-relevant="additions">
+        <div class="welcome" id="welcome">
+          <h3>Ask about leave, expenses, security, pricing or incidents</h3>
+          <p>Each answer cites the passages it used. Select a citation to read the source, or open Retrieval to see how it was ranked.</p>
+          <div class="suggest" id="suggest" role="group" aria-label="Example questions"></div>
+        </div>
+      </div>
+
+      <form class="composer" id="composer" autocomplete="off">
+        <div class="composer-box">
+          <label class="sr-only" for="q">Your question</label>
+          <textarea id="q" rows="1" maxlength="500" placeholder="Ask a question about the documents"></textarea>
+          <button class="btn primary send" type="submit" id="sendBtn">Ask <kbd>↵</kbd></button>
+        </div>
+        <div class="composer-foot">
+          <span id="userDocFlag" class="flag" hidden>Includes temporary document</span>
+          <span class="muted">Enter to send · Shift+Enter for a new line · 500 characters max</span>
+        </div>
+      </form>
+    </section>
+
+    <!-- Inspector: source viewer + retrieval -->
+    <aside class="col-right" id="sidePanel" aria-label="Sources and retrieval">
+      <div class="side-head">
+        <div class="tabs" role="tablist" aria-label="Inspector">
+          <button role="tab" class="tab active" data-tab="source" aria-selected="true" aria-controls="pane-source" id="tab-source">Source</button>
+          <button role="tab" class="tab" data-tab="debug" aria-selected="false" aria-controls="pane-debug" id="tab-debug">Retrieval</button>
+        </div>
+        <button type="button" class="icon-btn only-sheet" id="closeSide" aria-label="Close panel">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+        </button>
+      </div>
+      <div class="side-body">
+        <div class="tab-pane" id="pane-source" role="tabpanel" aria-labelledby="tab-source">
+          <div class="empty">
+            <p class="empty-title">No source selected</p>
+            <p>Select a citation such as <span class="cite demo">1</span> or a document to read it here, with the matching passage highlighted.</p>
+          </div>
+        </div>
+        <div class="tab-pane" id="pane-debug" role="tabpanel" aria-labelledby="tab-debug" hidden>
+          <div class="empty">
+            <p class="empty-title">No query yet</p>
+            <p>Ask a question to see retrieved chunks, BM25 scores, confidence and latency.</p>
+          </div>
+        </div>
+      </div>
+    </aside>
+    <div class="scrim" id="scrim" hidden></div>
+  </main>
+
+  <section class="how" aria-labelledby="how-title">
+    <div class="how-inner">
+      <h2 id="how-title">How an answer is produced</h2>
+      <ol class="how-grid">
+        <li><span>01</span><h4>Chunk</h4><p>Documents are split by heading into chunks of about 140 words, with overlap so facts are not cut in half.</p></li>
+        <li><span>02</span><h4>Rank</h4><p>BM25 with a heading boost and synonym expansion selects the top 5 chunks in about a millisecond.</p></li>
+        <li><span>03</span><h4>Check</h4><p>A confidence score tests whether the chunks cover the question. Below the threshold, it declines.</p></li>
+        <li><span>04</span><h4>Answer</h4><p>Gemini writes a grounded answer citing [1][2]. Without a key, an extractive composer quotes the passages.</p></li>
+      </ol>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <div class="foot-inner">
+      <div>
+        <p class="foot-title">Built by Sai Tarun · <a href="https://saitarun.com" target="_blank" rel="noopener">saitarun.com</a></p>
+        <nav class="foot-links" aria-label="Author links">
+          <a href="https://saitarun.com" target="_blank" rel="noopener">Website</a>
+          <a href="https://linkedin.com/in/ronanki-sai-tarun" target="_blank" rel="noopener">LinkedIn</a>
+          <a href="https://x.com/SaiTarunRonanki" target="_blank" rel="noopener">X</a>
+          <a href="https://github.com/Saitarun29/knowledge-assistant-rag" target="_blank" rel="noopener">GitHub repo</a>
+        </nav>
+        <p class="foot-note">Northwind Labs is a fictional company. All documents are sample data.</p>
+      </div>
+      <a class="btn primary" href="https://wa.me/918008941430?text=Hello%20Sai%20Tarun%20Ronanki,%20I%20want%20to%20discuss%20about%20my%20workflow" target="_blank" rel="noopener">Discuss your workflow</a>
+    </div>
+  </footer>
+
+  <script type="module" src="assets/app.js"></script>
+</body>
+</html>
