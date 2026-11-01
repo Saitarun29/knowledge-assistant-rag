@@ -1,12 +1,1 @@
-{
-  "name": "knowledge-assistant-rag",
-  "version": "1.0.0",
-  "description": "Internal Knowledge Assistant — retrieval-augmented chat over company docs with citations, a retrieval debug view and an n8n ingest pipeline.",
-  "type": "module",
-  "private": true,
-  "scripts": {
-    "dev": "node scripts/dev-server.mjs",
-    "test": "node scripts/smoke.mjs"
-  },
-  "license": "MIT"
-}
+{"description":"Internal knowledge assistant: cited answers from company docs, a clear refusal when the docs don't cover a question, a retrieval inspector, and an n8n ingest path into Supabase pgvector.","engines":{"node":">=18"},"license":"MIT","name":"knowledge-assistant-rag","private":true,"scripts":{"dev":"node scripts/dev-server.mjs","smoke":"node scripts/smoke.mjs","test":"node scripts/smoke.mjs"},"type":"module","version":"1.0.0"}

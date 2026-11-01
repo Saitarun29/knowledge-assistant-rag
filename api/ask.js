@@ -58,35 +58,61 @@ ${context}
 
 Question: ${question}`;
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12_000);
-  try {
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${encodeURIComponent(key)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: ctrl.signal,
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 600, responseMimeType: 'application/json' },
-        }),
-      },
-    );
-    if (!r.ok) return null;
-    const data = await r.json();
-    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
-    const out = JSON.parse(text);
-    if (typeof out.answer !== 'string') return null;
-    return out;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
+  // One retry on rate limits, server errors and timeouts. Any failure after
+  // that returns null and the caller falls back to the extractive composer,
+  // so a Gemini outage degrades the answer instead of failing the request.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12_000);
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${encodeURIComponent(key)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: ctrl.signal,
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 600, responseMimeType: 'application/json' },
+          }),
+        },
+      );
+      if (!r.ok) {
+        if (attempt === 0 && (r.status === 429 || r.status >= 500)) {
+          await new Promise((resolve) => setTimeout(resolve, 600));
+          continue;
+        }
+        return null;
+      }
+      const data = await r.json();
+      const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
+      const out = JSON.parse(text);
+      if (typeof out.answer !== 'string') return null;
+      return out;
+    } catch {
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        continue;
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  return null;
 }
 
 export default async function handler(req, res) {
+  try {
+    return await handleAsk(req, res);
+  } catch (err) {
+    // Last-resort guard: the client always gets JSON, never a stack trace.
+    console.error('ask handler failed:', err instanceof Error ? err.message : err);
+    if (!res.writableEnded) return send(res, 500, { error: 'Something went wrong while answering. Please try again.' });
+  }
+}
+
+async function handleAsk(req, res) {
   const t0 = performance.now();
   if (req.method === 'OPTIONS') return send(res, 204, {});
   if (req.method !== 'POST') return send(res, 405, { error: 'Use POST' });
@@ -96,6 +122,22 @@ export default async function handler(req, res) {
 
   let body;
   try { body = await readBody(req); } catch { return send(res, 400, { error: 'Invalid JSON body' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return send(res, 400, { error: 'Request body must be a JSON object.' });
+  }
+  if (body.question !== undefined && typeof body.question !== 'string') {
+    return send(res, 400, { error: 'question must be a string.' });
+  }
+  if (body.userDoc !== undefined && body.userDoc !== null
+    && (typeof body.userDoc !== 'object' || Array.isArray(body.userDoc) || typeof body.userDoc.text !== 'string')) {
+    return send(res, 400, { error: 'userDoc must be an object with a text string.' });
+  }
+  if (body.userDoc?.title !== undefined && typeof body.userDoc.title !== 'string') {
+    return send(res, 400, { error: 'userDoc.title must be a string.' });
+  }
+  if (body.topK !== undefined && !Number.isFinite(Number(body.topK))) {
+    return send(res, 400, { error: 'topK must be a number.' });
+  }
 
   const question = String(body.question || '').trim().slice(0, MAX_QUESTION);
   if (question.length < 3) return send(res, 400, { error: 'Ask a question (at least 3 characters).' });
