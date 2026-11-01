@@ -4,7 +4,7 @@
 
 A retrieval-augmented (RAG) chat assistant over an internal knowledge base. Every answer cites the passages it came from, every citation opens the source with the matching sentences highlighted, and a retrieval debug view shows exactly which chunks were found, how they scored and how long each step took.
 
-🔗 **Live demo:** https://knowledge-assistant-rag.vercel.app
+🔗 **Live demo:** https://knowledge-assistant-rag-phi.vercel.app
 📦 **Repo:** https://github.com/Saitarun29/knowledge-assistant-rag
 
 <!-- ![Internal Knowledge Assistant: chat with citations, source panel and retrieval debug](docs/screenshot.png) -->
